@@ -1,0 +1,24 @@
+# Build output
+target/
+
+# Python
+__pycache__/
+venv/
+.venv/
+
+# Firmware images, dumps and extracted modules: proprietary and/or
+# machine-specific (serials, UUIDs, MACs, embedded Windows keys). Never commit.
+*.bin
+*.rom
+*.ROM
+*.fd
+*.cap
+*.exe
+*.efi
+*.7z
+*.asm
+bios/
+dumps/
+
+# routecfg run output copied off the USB stick
+routecfg-out/

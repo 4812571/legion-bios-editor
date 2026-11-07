@@ -1,0 +1,9 @@
+[package]
+name = "routecfg"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[dependencies]
+uefi-raw = "0.14"
