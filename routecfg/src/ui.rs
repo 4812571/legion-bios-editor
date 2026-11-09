@@ -3,11 +3,13 @@ use alloc::string::String;
 
 use uefi_raw::table::runtime::ResetType;
 
+use crate::boot;
 use crate::cbs::{self, Session, Target, fmt_offsets, valid_speed};
 use crate::efi::{Efi, SCAN_DOWN, SCAN_ESC, SCAN_UP, color, print, println};
 use crate::history;
 
 const SHELL_PATH: &str = "\\EFI\\tools\\shell.efi";
+const MEMTEST_PATH: &str = "\\EFI\\tools\\memtest.efi";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Copy)]
@@ -15,17 +17,19 @@ enum Action {
     Set(u16),
     Custom,
     Auto,
+    MemTest,
     Status,
     Shell,
     Reboot,
     PowerOff,
 }
 
-const MENU: [(&str, Action); 8] = [
+const MENU: [(&str, Action); 9] = [
     ("Set 4800 MT/s", Action::Set(4800)),
     ("Set 5200 MT/s", Action::Set(5200)),
     ("Set custom speed...", Action::Custom),
     ("Restore stock (Auto)", Action::Auto),
+    ("Memory test (Memtest86+)", Action::MemTest),
     ("Status & history", Action::Status),
     ("UEFI Shell", Action::Shell),
     ("Reboot", Action::Reboot),
@@ -34,6 +38,7 @@ const MENU: [(&str, Action); 8] = [
 
 pub fn run(efi: &Efi) {
     efi.cursor(false);
+    run_pending_test(efi);
     let mut selected = 0usize;
     loop {
         crate::efi::take_log();
@@ -63,6 +68,14 @@ fn perform(efi: &Efi, action: Action) {
             }
         }
         Action::Auto => apply_flow(efi, Target::Auto),
+        Action::MemTest => {
+            if confirm(efi, "Start Memtest86+? It takes over the machine; press Esc in it to reboot.") {
+                efi.clear();
+                if let Err(e) = efi.launch(MEMTEST_PATH) {
+                    message(efi, color::BAD, &format!("Could not start Memtest86+: {e}"));
+                }
+            }
+        }
         Action::Status => status_screen(efi),
         Action::Shell => {
             efi.clear();
@@ -201,11 +214,14 @@ fn apply_flow(efi: &Efi, target: Target) {
             }
             efi.save("log.txt", crate::efi::take_log().as_bytes());
             println!();
-            if report.landed && confirm_inline(efi, " Reboot now? [Y/N] ") {
-                efi.reset(ResetType::COLD);
-            }
             if !report.landed {
                 wait_key(efi);
+                return;
+            }
+            match choose(efi, " [R] Reboot   [T] Reboot + memory test   [M] Menu : ", &['r', 't', 'm']) {
+                'r' => efi.reset(ResetType::COLD),
+                't' => reboot_into_test(efi, &target.tag()),
+                _ => {}
             }
         }
         Err(e) => {
@@ -215,6 +231,106 @@ fn apply_flow(efi: &Efi, target: Target) {
             efi.color(color::NORMAL);
             efi.save("log.txt", crate::efi::take_log().as_bytes());
             wait_key(efi);
+        }
+    }
+}
+
+const PENDING_FILE: &str = "pending.txt";
+const COUNTDOWN_SECS: usize = 5;
+
+fn reboot_into_test(efi: &Efi, tag: &str) {
+    if !efi.file_exists(MEMTEST_PATH) {
+        message(efi, color::BAD, &format!("{MEMTEST_PATH} is missing on this stick; rebuild it with make-usb.ps1."));
+        return;
+    }
+    let slot = match boot::schedule_self(efi) {
+        Ok(slot) => Some(slot),
+        Err(e) => {
+            efi.color(color::WARN);
+            println!();
+            println!(" Could not set BootNext ({e}).");
+            println!(" After the reboot, tap F12 and pick this USB stick; the test starts by itself.");
+            efi.color(color::NORMAL);
+            wait_key(efi);
+            None
+        }
+    };
+    let slot_text = slot.map_or(String::from("none"), |s| format!("{s:04X}"));
+    efi.save(PENDING_FILE, format!("memtest slot={slot_text} after={tag}").as_bytes());
+    if efi.read_file(PENDING_FILE).is_none() {
+        if let Some(s) = slot {
+            let _ = boot::remove_entry(efi, s);
+        }
+        message(efi, color::BAD, "Could not write the pending-test marker to the stick; not rebooting.");
+        return;
+    }
+    efi.save("log.txt", crate::efi::take_log().as_bytes());
+    efi.reset(ResetType::COLD);
+}
+
+/// If the previous run scheduled a memory test, clean up and start it after a countdown.
+fn run_pending_test(efi: &Efi) {
+    let Some(raw) = efi.read_file(PENDING_FILE) else { return };
+    efi.remove(PENDING_FILE);
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let slot = text
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("slot="))
+        .and_then(|s| u16::from_str_radix(s, 16).ok());
+    let cleanup = match slot {
+        Some(s) => boot::remove_entry(efi, s).err(),
+        None => None,
+    };
+
+    let setting = cbs::read_setting(efi).map(|s| s.describe()).unwrap_or_else(|e| e);
+    let running = efi
+        .memory_summary()
+        .filter(|m| m.dimms > 0)
+        .and_then(|m| m.configured_mts)
+        .map_or(String::from("unreported"), |v| format!("{v} MT/s"));
+    history::append(efi, &format!("{} | test boot | setting {setting} | running {running}", efi.now()));
+
+    efi.clear();
+    efi.color(color::TITLE);
+    println!(" Scheduled memory test");
+    efi.color(color::NORMAL);
+    println!();
+    println!("   CBS setting : {setting}");
+    println!("   Running now : {running}");
+    if let Some(e) = cleanup {
+        efi.color(color::WARN);
+        println!("   Boot entry cleanup: {e}");
+        efi.color(color::NORMAL);
+    }
+    println!();
+    efi.flush_keys();
+    for remaining in (1..=COUNTDOWN_SECS).rev() {
+        print!("\r   Starting Memtest86+ in {remaining}s - press any key for the menu ");
+        for _ in 0..10 {
+            if efi.poll_key().is_some() {
+                println!();
+                return;
+            }
+            efi.stall_ms(100);
+        }
+    }
+    println!();
+    efi.clear();
+    if let Err(e) = efi.launch(MEMTEST_PATH) {
+        message(efi, color::BAD, &format!("Could not start Memtest86+: {e}"));
+    }
+}
+
+fn choose(efi: &Efi, prompt: &str, options: &[char]) -> char {
+    print!("{prompt}");
+    efi.flush_keys();
+    loop {
+        let key = efi.read_key();
+        if let Some(c) = char::from_u32(u32::from(key.unicode_char)).map(|c| c.to_ascii_lowercase()) {
+            if options.contains(&c) {
+                println!("{}", c.to_ascii_uppercase());
+                return c;
+            }
         }
     }
 }

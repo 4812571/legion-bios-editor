@@ -163,6 +163,25 @@ impl Efi {
         Ok(buf)
     }
 
+    /// Writes a non-volatile, boot+runtime variable.
+    pub fn set_variable(&self, name: &str, vendor: &Guid, data: &[u8]) -> Result<(), String> {
+        let name16 = to_u16z(name);
+        let attrs = VariableAttributes::NON_VOLATILE
+            | VariableAttributes::BOOTSERVICE_ACCESS
+            | VariableAttributes::RUNTIME_ACCESS;
+        let status =
+            unsafe { (self.rt().set_variable)(name16.as_ptr(), vendor, attrs, data.len(), data.as_ptr()) };
+        check(status, &format!("SetVariable({name})"))
+    }
+
+    pub fn delete_variable(&self, name: &str, vendor: &Guid) -> Result<(), String> {
+        let name16 = to_u16z(name);
+        let status = unsafe {
+            (self.rt().set_variable)(name16.as_ptr(), vendor, VariableAttributes::empty(), 0, ptr::null())
+        };
+        check(status, &format!("DeleteVariable({name})"))
+    }
+
     pub fn take_fw_string(&self, p: *mut u16) -> String {
         if p.is_null() {
             return String::new();
@@ -220,6 +239,20 @@ impl Efi {
                 return key;
             }
         }
+    }
+
+    /// Returns a pending key press without blocking.
+    pub fn poll_key(&self) -> Option<InputKey> {
+        let inp = self.stdin();
+        if inp.is_null() {
+            return None;
+        }
+        let mut key = InputKey::default();
+        (!unsafe { ((*inp).read_key_stroke)(inp, &mut key) }.is_error()).then_some(key)
+    }
+
+    pub fn stall_ms(&self, ms: usize) {
+        let _ = unsafe { (self.bs().stall)(ms * 1000) };
     }
 
     pub fn flush_keys(&self) {
@@ -299,8 +332,8 @@ impl Efi {
         Some((addr as *const u8, len))
     }
 
-    /// Loads and runs another EFI image from the volume this app was loaded from.
-    pub fn launch(&self, path: &str) -> Result<(), String> {
+    /// Device path of `path` on the volume this app was loaded from.
+    pub fn file_device_path(&self, path: &str) -> Result<Vec<u8>, String> {
         let li = self.loaded_image()?;
         let dev = self.handle_protocol(li.device_handle, &DevicePathProtocol::GUID)? as *const u8;
         let mut dp = device_path_prefix(dev);
@@ -311,7 +344,17 @@ impl Efi {
             dp.extend_from_slice(&c.to_le_bytes());
         }
         dp.extend_from_slice(&[0x7F, 0xFF, 0x04, 0x00]);
+        Ok(dp)
+    }
 
+    /// Whether `path` exists on the volume this app was loaded from.
+    pub fn file_exists(&self, path: &str) -> bool {
+        self.volume_root().and_then(|root| root.open(path, FileMode::READ, FileAttribute::empty())).is_ok()
+    }
+
+    /// Loads and runs another EFI image from the volume this app was loaded from.
+    pub fn launch(&self, path: &str) -> Result<(), String> {
+        let dp = self.file_device_path(path)?;
         let mut child: Handle = ptr::null_mut();
         let status = unsafe {
             (self.bs().load_image)(
@@ -358,14 +401,27 @@ impl Efi {
         Some(out)
     }
 
-    fn out_dir(&self) -> Result<FileGuard, String> {
+    /// Deletes `\routecfg\<name>` if it exists.
+    pub fn remove(&self, name: &str) {
+        if let Ok(dir) = self.out_dir() {
+            if let Ok(file) = dir.open(name, FileMode::READ | FileMode::WRITE, FileAttribute::empty()) {
+                file.delete();
+            }
+        }
+    }
+
+    fn volume_root(&self) -> Result<FileGuard, String> {
         let li = self.loaded_image()?;
         let sfs =
             self.handle_protocol(li.device_handle, &SimpleFileSystemProtocol::GUID)? as *mut SimpleFileSystemProtocol;
         let mut root: *mut FileProtocolV1 = ptr::null_mut();
         check(unsafe { ((*sfs).open_volume)(sfs, &mut root) }, "OpenVolume")?;
-        let root = FileGuard(root);
-        root.open(OUT_DIR, FileMode::READ | FileMode::WRITE | FileMode::CREATE, FileAttribute::DIRECTORY)
+        Ok(FileGuard(root))
+    }
+
+    fn out_dir(&self) -> Result<FileGuard, String> {
+        self.volume_root()?
+            .open(OUT_DIR, FileMode::READ | FileMode::WRITE | FileMode::CREATE, FileAttribute::DIRECTORY)
     }
 
     fn try_save(&self, name: &str, data: &[u8]) -> Result<(), String> {

@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod boot;
 mod cbs;
 mod config;
 mod efi;
