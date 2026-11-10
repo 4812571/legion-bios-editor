@@ -1,6 +1,9 @@
 # Build output
 target/
 
+# Claude Code worktrees and local state
+.claude/
+
 # Python
 __pycache__/
 venv/
