@@ -71,18 +71,21 @@ IFR_OPCODE_NAMES = {
     0x17: "NOT",
     0x19: "GRAYOUTIF",
     0x1a: "DATE",
+    0x1e: "DISABLEIF",
     0x24: "VARSTORE",
     0x26: "EFIVARSTORE",
-    0x27: "DISABLEIF",
+    0x27: "VARSTORE_DEVICE",
     0x29: "END",
-    0x2a: "FALSE?",
-    0x31: "NOT?",
-    0x3d: "ACTION?",
+    0x2a: "MATCH",
+    0x31: "GREATER_THAN",
+    0x3d: "DIVIDE",
     0x46: "TRUE",
     0x47: "FALSE",
     0x5b: "DEFAULT",
     0x5f: "GUID",
 }
+
+REF_FORM_ID = 13  # EFI_IFR_REF.FormId, after the opcode and question headers
 
 ONE_OF_OPTION_DEFAULT = 0x10
 ONE_OF_OPTION_DEFAULT_MFG = 0x20

@@ -26,8 +26,8 @@ def describe(seg: bytes, op: Opcode, strings: dict[int, str], varstores: dict[in
         q = ifr.parse_question(seg, pos)
         varstore = varstores.get(q.varstore_id, q.varstore_id)
         text = f'"{strings.get(q.prompt)}" qid={q.question_id} vs={varstore} off=0x{q.varstore_offset:x}'
-        if op.code == ifr.OP_REF and op.length >= 17:
-            text += f" -> form {struct.unpack_from('<H', seg, pos + 15)[0]}"
+        if op.code == ifr.OP_REF and op.length >= ifr.REF_FORM_ID + 2:
+            text += f" -> form {struct.unpack_from('<H', seg, pos + ifr.REF_FORM_ID)[0]}"
         return text
     if op.code == ifr.OP_EQ_ID_VAL:
         question_id, value = struct.unpack_from("<HH", seg, pos + 2)
