@@ -1,20 +1,54 @@
-import struct,re,uuid
-def pe_at(b,off):
-    for m in reversed([m.start() for m in re.finditer(b'MZ',b[max(0,off-0x400000):off])]):
-        m+=max(0,off-0x400000)
+"""Locate the firmware module enclosing a file offset (library, no CLI)."""
+
+import re
+import struct
+from collections.abc import Iterator
+
+_PE_SEARCH_WINDOW = 0x400000
+_TE_SEARCH_WINDOW = 0x100000
+_E_LFANEW = 0x3C
+_MAX_E_LFANEW = 0x1000
+_PE_SIZE_OF_IMAGE = 0x50  # relative to the "PE\0\0" signature
+
+_UTF16_IDENTIFIER = re.compile(rb"((?:[A-Za-z0-9_]\x00){4,})\x00\x00")
+
+
+def _rfind_all(data: bytes, needle: bytes, lo: int, hi: int) -> Iterator[int]:
+    """Offsets of `needle` within data[lo:hi], nearest to `hi` first."""
+    pos = data.rfind(needle, lo, hi)
+    while pos != -1:
+        yield pos
+        pos = data.rfind(needle, lo, pos)
+
+
+def enclosing_image(data: bytes, offset: int) -> tuple[int, int | None] | None:
+    """(start, SizeOfImage) of the nearest preceding PE image that covers `offset`.
+
+    If no PE image covers it, falls back to the nearest preceding TE image
+    ("VZ", used by PEI modules) as (start, None), without checking that it
+    covers `offset`. Returns None if neither is found.
+    """
+    for start in _rfind_all(data, b"MZ", max(0, offset - _PE_SEARCH_WINDOW), offset):
         try:
-            pe=struct.unpack_from('<I',b,m+0x3c)[0]
-            if pe<0x1000 and b[m+pe:m+pe+4]==b'PE\0\0':
-                img=struct.unpack_from('<I',b,m+pe+0x50)[0]
-                if m<=off<m+img: return m,img
-        except: pass
-    # TE images (PEI): 'VZ'
-    for m in reversed([m.start() for m in re.finditer(b'VZ',b[max(0,off-0x100000):off])]):
-        m+=max(0,off-0x100000)
-        return m,None
-    return None
-def ui_name(b,base,sz):
-    after=b[base+sz:base+sz+0x400] if sz else b[base:base+0x40000]
-    m=re.search(rb'\x15((?:[\x20-\x7e]\x00){3,})\x00\x00',b[base-0x40:base+(sz or 0)+0x400])
-    m2=re.search(rb'((?:[A-Za-z0-9_]\x00){4,})\x00\x00',after)
-    return m2.group(1).decode('utf-16-le') if m2 else '?'
+            e_lfanew = struct.unpack_from("<I", data, start + _E_LFANEW)[0]
+            pe = start + e_lfanew
+            if e_lfanew < _MAX_E_LFANEW and data[pe : pe + 4] == b"PE\0\0":
+                size = struct.unpack_from("<I", data, pe + _PE_SIZE_OF_IMAGE)[0]
+                if start <= offset < start + size:
+                    return start, size
+        except struct.error:
+            pass
+
+    te_start = next(_rfind_all(data, b"VZ", max(0, offset - _TE_SEARCH_WINDOW), offset), None)
+    return (te_start, None) if te_start is not None else None
+
+
+def ui_name(data: bytes, base: int, size: int | None) -> str:
+    """Best-effort module name: the first UTF-16 identifier after the image.
+
+    A module's FFS user-interface section usually follows its image. With no
+    size (TE images), searches the 256 KiB starting at `base`.
+    """
+    window = data[base + size : base + size + 0x400] if size else data[base : base + 0x40000]
+    m = _UTF16_IDENTIFIER.search(window)
+    return m.group(1).decode("utf-16-le") if m else "?"

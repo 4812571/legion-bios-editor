@@ -1,44 +1,174 @@
-import sys,re; S=sys.argv[1]
-exec(open(S+'/fwdis.py').read())
-b=open(S+'/bios/lz/b1.bin','rb').read()
-base=int(sys.argv[2],16); p=PE(b,base)
-BS={0x28:'AllocatePages',0x40:'AllocatePool',0x48:'FreePool',0x50:'CreateEvent',0x68:'SignalEvent',0x70:'CloseEvent',0x98:'HandleProtocol',0xa8:'RegisterProtocolNotify',0xb0:'LocateHandle',0x140:'LocateProtocol',0x148:'InstallMultipleProtocolInterfaces',0x170:'CreateEventEx',0x138:'LocateHandleBuffer'}
-RT={0x48:'GetVariable',0x50:'GetNextVariableName',0x58:'SetVariable',0x68:'ResetSystem'}
-md=Cs(CS_ARCH_X86,CS_MODE_64); md.detail=True
-# find gBS/gRT globals: mov [rip+x], rax after mov rax,[rdx+0x60]/[rdx+0x58]
-g={}
-for a,e in funcs(p):
-    last=None
-    for ins in md.disasm(p.img[a:e],a):
-        if ins.mnemonic=='mov' and ins.op_count(X86_OP_MEM)==1:
-            o=ins.operands
-            if o[1].type==X86_OP_MEM and o[1].mem.base in (X86_REG_RDX,X86_REG_RCX,X86_REG_RAX) and o[1].mem.disp in (0x58,0x60) and o[0].type==X86_OP_REG: last=(o[0].reg,o[1].mem.disp)
-            elif o[0].type==X86_OP_MEM and o[0].mem.base==X86_REG_RIP and last and o[1].type==X86_OP_REG and o[1].reg==last[0]:
-                g[ins.address+ins.size+o[0].mem.disp]='gRT' if last[1]==0x58 else 'gBS'; last=None
-print('globals',{hex(k):v for k,v in g.items()})
-lo,hi=(int(sys.argv[3],16),int(sys.argv[4],16)) if len(sys.argv)>4 else (0,p.size)
-for a,e in funcs(p):
-    if not (lo<=a<hi): continue
-    regsrc={}; lines=[]
-    for ins in md.disasm(p.img[a:e],a):
-        c=''
+"""Condensed summary of a DXE module's functions.
+
+Lists, per function, its calls (resolving gBS/gRT service calls), string
+references, large immediates, and accesses to the AmdSetup memory-speed
+bytes.
+"""
+
+import argparse
+
+from capstone import CsInsn
+from capstone.x86 import (
+    X86_OP_IMM,
+    X86_OP_MEM,
+    X86_OP_REG,
+    X86_REG_RAX,
+    X86_REG_RCX,
+    X86_REG_RDX,
+    X86_REG_RIP,
+    X86_REG_RSP,
+)
+
+import fwdis
+from fwdis import PeImage
+
+# EFI_SYSTEM_TABLE field offsets.
+SYSTEM_TABLE_RUNTIME_SERVICES = 0x58
+SYSTEM_TABLE_BOOT_SERVICES = 0x60
+
+BOOT_SERVICES = {
+    0x28: "AllocatePages",
+    0x40: "AllocatePool",
+    0x48: "FreePool",
+    0x50: "CreateEvent",
+    0x68: "SignalEvent",
+    0x70: "CloseEvent",
+    0x98: "HandleProtocol",
+    0xA8: "RegisterProtocolNotify",
+    0xB0: "LocateHandle",
+    0x138: "LocateHandleBuffer",
+    0x140: "LocateProtocol",
+    0x148: "InstallMultipleProtocolInterfaces",
+    0x170: "CreateEventEx",
+}
+RUNTIME_SERVICES = {
+    0x48: "GetVariable",
+    0x50: "GetNextVariableName",
+    0x58: "SetVariable",
+    0x68: "ResetSystem",
+}
+SERVICE_TABLES = {"gBS": BOOT_SERVICES, "gRT": RUNTIME_SERVICES}
+
+# AmdSetup bytes that routecfg writes: timing mode and target speed.
+AMDSETUP_SPEED_OFFSETS = (0x58, 0x59)
+
+_SYSTEM_TABLE_REGISTERS = (X86_REG_RDX, X86_REG_RCX, X86_REG_RAX)
+
+
+def find_service_globals(pe: PeImage) -> dict[int, str]:
+    """Find the gBS/gRT globals, mapping their RVAs to "gBS"/"gRT".
+
+    Matches `mov reg, [SystemTable+0x58/0x60]` followed later in the same
+    function by `mov [rip+X], reg`.
+    """
+    md = fwdis.disassembler()
+    found: dict[int, str] = {}
+    for start, end in fwdis.find_functions(pe):
+        loaded: tuple[int, int] | None = None  # (register, system-table field)
+        for ins in md.disasm(pe.image[start:end], start):
+            if ins.mnemonic != "mov" or ins.op_count(X86_OP_MEM) != 1:
+                continue
+            dest, src = ins.operands
+            if (
+                src.type == X86_OP_MEM
+                and src.mem.base in _SYSTEM_TABLE_REGISTERS
+                and src.mem.disp in (SYSTEM_TABLE_RUNTIME_SERVICES, SYSTEM_TABLE_BOOT_SERVICES)
+                and dest.type == X86_OP_REG
+            ):
+                loaded = (dest.reg, src.mem.disp)
+            elif (
+                dest.type == X86_OP_MEM
+                and dest.mem.base == X86_REG_RIP
+                and loaded
+                and src.type == X86_OP_REG
+                and src.reg == loaded[0]
+            ):
+                global_rva = ins.address + ins.size + dest.mem.disp
+                found[global_rva] = "gRT" if loaded[1] == SYSTEM_TABLE_RUNTIME_SERVICES else "gBS"
+                loaded = None
+    return found
+
+
+def _call_target(ins: CsInsn, table_for_reg: dict[int, str]) -> str | None:
+    op = ins.operands[0]
+    if op.type == X86_OP_MEM and op.mem.base in table_for_reg:
+        table = table_for_reg[op.mem.base]
+        service = SERVICE_TABLES[table].get(op.mem.disp, hex(op.mem.disp))
+        return f"{table}->{service}"
+    if op.type == X86_OP_MEM:
+        base = ins.reg_name(op.mem.base) if op.mem.base else "rip"
+        return f"indirect [{base}+{op.mem.disp:#x}]"
+    if op.type == X86_OP_IMM:
+        return f"sub_{op.imm:x}"
+    return None
+
+
+def _has_large_immediate(ins: CsInsn) -> bool:
+    return ins.mnemonic in ("mov", "cmp", "and", "or") and any(
+        op.type == X86_OP_IMM and op.imm > 0xFFFF and op.imm & 0xFFFFFFFF != 0xFFFFFFFF
+        for op in ins.operands
+    )
+
+
+def _touches_speed_offsets(ins: CsInsn) -> bool:
+    return ins.mnemonic in ("mov", "movzx", "cmp") and any(
+        op.type == X86_OP_MEM
+        and op.mem.disp in AMDSETUP_SPEED_OFFSETS
+        and op.mem.base not in (X86_REG_RSP, X86_REG_RIP)
+        for op in ins.operands
+    )
+
+
+def summarize_function(
+    pe: PeImage, start: int, end: int, service_globals: dict[int, str]
+) -> list[str]:
+    table_for_reg: dict[int, str] = {}  # register -> "gBS"/"gRT" last loaded into it
+    lines = []
+    for ins in fwdis.disassembler().disasm(pe.image[start:end], start):
+        comment = ""
         for op in ins.operands:
-            if op.type==X86_OP_MEM and op.mem.base==X86_REG_RIP:
-                t=ins.address+ins.size+op.mem.disp
-                if t in g and ins.mnemonic=='mov' and ins.operands[0].type==X86_OP_REG: regsrc[ins.operands[0].reg]=g[t]
-                s=p.u16str(t); s2=p.astr(t)
-                if s: c=f'L"{s}"'
-                elif s2: c=f'"{s2}"'
-        if ins.mnemonic=='call':
-            op=ins.operands[0]
-            if op.type==X86_OP_MEM and op.mem.base in regsrc:
-                tb=regsrc[op.mem.base]; c=(BS if tb=='gBS' else RT).get(op.mem.disp,hex(op.mem.disp)); c=f'{tb}->{c}'
-            elif op.type==X86_OP_MEM: c=f'indirect [{ins.reg_name(op.mem.base) if op.mem.base else "rip"}+{op.mem.disp:#x}]'
-            elif op.type==X86_OP_IMM: c=f'sub_{op.imm:x}'
-            lines.append(f'  {ins.address:6x}: CALL {c}')
-        elif c: lines.append(f'  {ins.address:6x}: {ins.mnemonic} {ins.op_str}  ; {c}')
-        elif ins.mnemonic in('mov','cmp','and','or') and any(op.type==X86_OP_IMM and op.imm>0xffff and op.imm&0xffffffff not in (0xffffffff,) for op in ins.operands):
-            lines.append(f'  {ins.address:6x}: {ins.mnemonic} {ins.op_str}')
-        elif ins.mnemonic in ('mov','movzx','cmp') and any(op.type==X86_OP_MEM and op.mem.disp in (0x58,0x59) and op.mem.base not in (X86_REG_RSP,X86_REG_RIP) for op in ins.operands):
-            lines.append(f'  {ins.address:6x}: {ins.mnemonic} {ins.op_str}   <-- off 0x58/0x59')
-    if lines: print(f'\n== func {a:#x}-{e:#x}'); print('\n'.join(lines))
+            target = fwdis.rip_target(ins, op)
+            if target is None:
+                continue
+            dest = ins.operands[0]
+            if target in service_globals and ins.mnemonic == "mov" and dest.type == X86_OP_REG:
+                table_for_reg[dest.reg] = service_globals[target]
+            comment = fwdis.string_label(pe, target) or comment
+
+        if ins.mnemonic == "call":
+            lines.append(f"  {ins.address:6x}: CALL {_call_target(ins, table_for_reg) or comment}")
+        elif comment:
+            lines.append(f"  {ins.address:6x}: {ins.mnemonic} {ins.op_str}  ; {comment}")
+        elif _has_large_immediate(ins):
+            lines.append(f"  {ins.address:6x}: {ins.mnemonic} {ins.op_str}")
+        elif _touches_speed_offsets(ins):
+            lines.append(f"  {ins.address:6x}: {ins.mnemonic} {ins.op_str}   <-- off 0x58/0x59")
+    return lines
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("workdir", help="extraction directory containing bios/lz/b1.bin")
+    parser.add_argument("base", type=fwdis.hex_int, help="module offset in b1.bin (hex)")
+    parser.add_argument("lo", type=fwdis.hex_int, nargs="?", help="only functions starting at or after this RVA (hex)")
+    parser.add_argument("hi", type=fwdis.hex_int, nargs="?", help="only functions starting before this RVA (hex)")
+    args = parser.parse_args()
+    if (args.lo is None) != (args.hi is None):
+        parser.error("give both lo and hi, or neither")
+
+    pe = PeImage(fwdis.load_dxe_volume(args.workdir), args.base)
+    service_globals = find_service_globals(pe)
+    print("globals", {hex(k): v for k, v in service_globals.items()})
+
+    lo, hi = (args.lo, args.hi) if args.hi is not None else (0, pe.size)
+    for start, end in fwdis.find_functions(pe):
+        if not lo <= start < hi:
+            continue
+        lines = summarize_function(pe, start, end, service_globals)
+        if lines:
+            print(f"\n== func {start:#x}-{end:#x}")
+            print("\n".join(lines))
+
+
+if __name__ == "__main__":
+    main()
